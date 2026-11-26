@@ -11,7 +11,7 @@ from pathlib import Path
 import re, uuid, logging
 from starlette.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, RedirectResponse, Response
-import json, hashlib, threading
+import json, hashlib, threading, shutil
 
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 auth = HTTPBasic()
@@ -263,6 +263,81 @@ def controls(chat):
 def refresh_button():
     return '<form method="post" action="/contacts/refresh"><input type="hidden" name="token" value="'+csrf()+'"><button>Aggiorna contatti e foto</button></form>'
 
+
+def size_label(n):
+    for unit in ("B","KB","MB","GB","TB"):
+        if n<1024 or unit=="TB":
+            return f"{n:.2f} {unit}"
+        n/=1024
+
+def storage_summary():
+    database=sum(p.stat().st_size for p in Path("/data").glob("archive.sqlite*") if p.is_file())
+    media=sum(p.stat().st_size for p in MEDIA.iterdir() if p.is_file())
+    return "DB: "+size_label(database)+" · Media: "+size_label(media)+" · Totale: "+size_label(database+media)
+
+def page(title,body):
+    return '<!doctype html><html lang="it"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>'+esc(title)+'</title><style>body{font:15px system-ui;margin:24px}table{border-collapse:collapse;width:100%}td,th{padding:9px;border-bottom:1px solid #ccc;text-align:left}button{padding:8px}img{max-width:90px;max-height:70px}</style><a href="/">Torna alle chat</a><h1>'+esc(title)+'</h1>'+body+'</html>'
+
+@app.get("/storage",response_class=HTMLResponse)
+def storage(category: str="", _: None=Depends(authorized)):
+    with closing(db()) as c:
+        rows=c.execute("SELECT e.id,e.media_file,e.media_name,e.media_type,e.chat,e.received,coalesce(k.name,e.chat) FROM events e LEFT JOIN contacts k ON k.chat=e.chat WHERE e.media_file IS NOT NULL ORDER BY e.media_size DESC").fetchall()
+    items=[]
+    totals={}
+    for mid,f,name,mime,chat,stamp,label in rows:
+        if not re.fullmatch(r"[a-f0-9]{32}",f):
+            continue
+        p=MEDIA/f
+        exists=p.is_file()
+        try:
+            n=p.stat().st_size if exists else 0
+        except FileNotFoundError:
+            n,exists=0,False
+        kind=(mime or "").split("/")[0]
+        kind=kind if kind in ("image","video","audio") else "document"
+        totals[kind]=totals.get(kind,0)+n
+        if category and category!=kind:
+            continue
+        url="/media/"+f
+        preview='<img loading="lazy" src="'+url+'">' if exists and kind=="image" else ""
+        link='<a href="'+url+'?download=true">'+esc(name or f)+'</a>' if exists else esc(name or f)+" (file mancante)"
+        items.append('<tr><td><input type="checkbox" name="ids" value="'+str(mid)+'"></td><td>'+preview+link+'<small> '+esc(f)+'</small></td><td>'+esc(label)+'</td><td>'+datetime.fromtimestamp(stamp,ZoneInfo("Europe/Rome")).strftime("%d/%m/%Y %H:%M")+'</td><td>'+size_label(n)+'</td></tr>')
+    hidden='<input type="hidden" name="token" value="'+csrf()+'">'
+    filters=' · '.join('<a href="/storage?category='+k+'">'+v+'</a>' for k,v in (("","Tutti"),("image","Foto"),("video","Video"),("audio","Audio"),("document","Documenti")))
+    body='<p>'+esc(storage_summary())+' · Libero sul filesystem media: '+size_label(shutil.disk_usage(MEDIA).free)+'</p><p>'+esc(" · ".join(k+": "+size_label(v) for k,v in totals.items()))+'</p><p>Cartella Windows prevista: <code>C:\\WhatsAppArchive\\media</code> (solo dopo migrazione).</p><p>'+filters+'</p>'
+    body+='<form method="post" action="/storage/delete" onsubmit="return confirm(&quot;Eliminare gli allegati selezionati?&quot;)">'+hidden+'<button>Elimina allegati selezionati</button><table><tr><th></th><th>File</th><th>Contatto</th><th>Data</th><th>Dimensione</th></tr>'+''.join(items)+'</table></form>'
+    for action,label in (("cleanup","Rimuovi riferimenti ai file mancanti"),("vacuum","Ottimizza database")):
+        body+='<form method="post" action="/storage/'+action+'">'+hidden+'<button>'+label+'</button></form>'
+    return page("Gestione media",body)
+
+@app.post("/storage/{action}")
+async def storage_action(action: str,request: Request,_: None=Depends(authorized)):
+    data=await form_data(request)
+    return await run_in_threadpool(storage_action_sync,action,data)
+
+def storage_action_sync(action,data):
+    with closing(db()) as c:
+        if action=="vacuum":
+            c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            c.execute("VACUUM")
+            c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        elif action in ("delete","cleanup"):
+            ids=[int(x) for x in data.get("ids",[]) if x.isdecimal()][:1000]
+            with c:
+                rows=c.execute("SELECT id,media_file FROM events WHERE media_file IS NOT NULL").fetchall()
+                for mid,f in rows:
+                    if not re.fullmatch(r"[a-f0-9]{32}",f):
+                        continue
+                    p=MEDIA/f
+                    if (action=="delete" and mid in ids) or (action=="cleanup" and not p.is_file()):
+                        c.execute("UPDATE events SET media_file=NULL,media_size=NULL,media_error=? WHERE id=?",("Allegato rimosso dall archivio",mid))
+                        if not c.execute("SELECT 1 FROM events WHERE media_file=?",(f,)).fetchone():
+                            p.unlink(missing_ok=True)
+        else:
+            raise HTTPException(404)
+    return RedirectResponse("/storage",303)
+
+
 @app.get("/", response_class=HTMLResponse)
 def dashboard(q: str = "", chat: str = "", contact_q: str = "", _: None = Depends(authorized)):
     with closing(db()) as c:
@@ -289,7 +364,9 @@ def dashboard(q: str = "", chat: str = "", contact_q: str = "", _: None = Depend
         cls = direction if direction in ("in","out") else "unknown"
         label = {"in":"Ricevuto","out":"Inviato","unknown":"Direzione non disponibile"}[cls]
         preview = ""
-        if mfile:
+        if mfile and not (MEDIA/mfile).is_file():
+            preview = "<p>Allegato rimosso o mancante</p>"
+        elif mfile:
             url = "/media/"+esc(mfile)
             mime = (mtype or "").split(";")[0]
             if mime in ("image/jpeg","image/png","image/webp","image/gif"):
@@ -304,4 +381,4 @@ def dashboard(q: str = "", chat: str = "", contact_q: str = "", _: None = Depend
         bubbles += '<article class="bubble '+cls+'"><small>'+esc(contacts.get(name,(None,False))[0] or name)+' · '+label+'</small><div>'+esc(body or "[Messaggio senza testo]")+'</div>'+preview+'<small>'+date+'</small>'+('<p style="color:#c44">Messaggio revocato su WhatsApp · '+datetime.fromtimestamp(int(revoked),ZoneInfo("Europe/Rome")).strftime("%d/%m/%Y %H:%M")+'</p>' if revoked else '')+'<label><input type="checkbox" name="ids" value="'+str(mid)+'" form="delete-selected"> Seleziona</label></article>'
     return """<!doctype html><html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WhatsApp Archive</title><style>
     *{box-sizing:border-box}body{margin:0;font:15px system-ui;background:#eef2ef;color:#17251e}header{padding:16px;background:#075e54;color:white}main{display:grid;grid-template-columns:minmax(180px,30%) 1fr;min-height:80vh}aside{background:white;border-right:1px solid #ccc;padding:12px;overflow-wrap:anywhere}.contact{display:block;padding:14px;color:inherit;text-decoration:none;border-bottom:1px solid #ddd}.avatar{width:38px;height:38px;border-radius:50%;object-fit:cover;float:left;margin-right:10px}.initials{display:grid;place-items:center;background:#d9eee6;color:#075e54;font-weight:bold}.contact{min-height:70px;overflow:hidden}.active{background:#d9eee6}small{display:block;opacity:.75;font-size:12px}section{padding:16px;min-width:0}.bubble{max-width:85%;width:fit-content;background:white;border-radius:12px;padding:12px;margin:10px 0;overflow-wrap:anywhere}.bubble div{white-space:pre-wrap;margin:6px 0}.out{margin-left:auto;background:#d9fdd3}.unknown{background:#e5e5e5}form{display:flex;gap:8px;flex-wrap:wrap}input,button{padding:10px;border:1px solid #aaa;border-radius:6px}a{color:inherit}@media(prefers-color-scheme:dark){body{background:#15221e;color:#eee}aside,.bubble{background:#263830}.out,.active{background:#285b48}.unknown{background:#424242}}@media(max-width:600px){main{grid-template-columns:1fr}aside{max-height:30vh;overflow:auto}}
-    </style></head><body><header><strong>WhatsApp Archive v0.4.2</strong> · """+str(total)+""" messaggi</header><main><aside><a href="/">Conversazioni</a> · <a href="/?q=%25">Tutte</a>"""+refresh_button()+contact_search+links+"""</aside><section><form><input type="hidden" name="chat" value=" """ .rstrip()+esc(chat)+'''"><input name="q" placeholder="Cerca nella conversazione" value="'''+esc(q)+'''"><button>Cerca</button><a href="/?q='''+esc(urlencode({"q":q})[2:])+'''">Ricerca globale</a></form><h2>'''+esc(contacts.get(chat,(None,False))[0] or chat or "Tutte le conversazioni")+'''</h2><p>Ultimi 300 risultati · aggiorna la pagina per nuovi messaggi</p>'''+controls(chat)+(bubbles or "<p>Nessun messaggio trovato.</p>")+'''</section></main></body></html>'''
+    </style></head><body><header><strong>WhatsApp Archive v0.5</strong> · """+str(total)+""" messaggi <span style="float:right">"""+esc(storage_summary())+""" · <a href="/storage">Gestione media</a></span></header><main><aside><a href="/">Conversazioni</a> · <a href="/?q=%25">Tutte</a>"""+refresh_button()+contact_search+links+"""</aside><section><form><input type="hidden" name="chat" value=" """ .rstrip()+esc(chat)+'''"><input name="q" placeholder="Cerca nella conversazione" value="'''+esc(q)+'''"><button>Cerca</button><a href="/?q='''+esc(urlencode({"q":q})[2:])+'''">Ricerca globale</a></form><h2>'''+esc(contacts.get(chat,(None,False))[0] or chat or "Tutte le conversazioni")+'''</h2><p>Ultimi 300 risultati · aggiorna la pagina per nuovi messaggi</p>'''+controls(chat)+(bubbles or "<p>Nessun messaggio trovato.</p>")+'''</section></main></body></html>'''
