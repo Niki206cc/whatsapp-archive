@@ -136,24 +136,25 @@ async def webhook(request: Request):
 
 message_lock=threading.Lock()
 
+def group_sender(p,chat):
+    if not chat.endswith("@g.us"):
+        return None,None
+    if p.get("fromMe"):
+        return None,"Tu"
+    data=p.get("_data") or {}
+    key=data.get("key") or {}
+    parts=str(p.get("id") or "").split("_",3)
+    suffix=parts[3] if len(parts)==4 else None
+    candidate=key.get("participantAlt") or key.get("participant") or p.get("participant") or p.get("author") or data.get("participant") or suffix
+    sender=candidate.replace("@s.whatsapp.net","@c.us") if isinstance(candidate,str) and re.fullmatch(r"[0-9]+(?::[0-9]+)?@(lid|s\.whatsapp\.net|c\.us)",candidate) else None
+    name=data.get("pushName") or data.get("verifiedBizName") or p.get("pushName")
+    return sender,name[:200] if isinstance(name,str) and name else None
+
 def store_message(p,chat):
     mid=str(p.get("id") or "")
     stamp=p.get("timestamp")
     stamp=int(stamp) if isinstance(stamp,(int,float)) and 0<stamp<4102444800 else int(time.time())
-    sender_id=None
-    sender_name=None
-    if chat.endswith("@g.us"):
-        data=p.get("_data") or {}
-        key=data.get("key") or {}
-        if p.get("fromMe"):
-            sender_name="Tu"
-        else:
-            candidate=key.get("participantAlt") or key.get("participant") or p.get("participant") or p.get("author")
-            if isinstance(candidate,str) and not candidate.endswith("@g.us"):
-                sender_id=candidate.replace("@s.whatsapp.net","@c.us")
-            push=data.get("pushName") or p.get("pushName")
-            if isinstance(push,str) and push:
-                sender_name=push[:200]
+    sender_id,sender_name=group_sender(p,chat)
     with message_lock:
         with closing(db()) as c,c:
             if mid and c.execute("SELECT 1 FROM events WHERE kind='message.any' AND message_id=?",(mid,)).fetchone():
@@ -425,7 +426,7 @@ import_guard=threading.Lock()
 import_cancel=threading.Event()
 import_status={"running":False,"added":0,"duplicates":0,"failed":0,"detail":"Nessuna importazione avviata"}
 
-def history_worker(chats):
+def history_worker(chats,senders_only=False):
     from urllib.parse import quote
     try:
         for chat in chats:
@@ -435,7 +436,7 @@ def history_worker(chats):
                 import_status["detail"]="Importazione: "+chat+" · "+str(offset)
                 for attempt in range(3):
                     try:
-                        batch=waha_json("/api/default/chats/"+quote(chat,safe="")+"/messages",{"limit":20,"offset":offset,"downloadMedia":"true"},timeout=120)
+                        batch=waha_json("/api/default/chats/"+quote(chat,safe="")+"/messages",{"limit":20,"offset":offset,"downloadMedia":"false" if senders_only else "true"},timeout=120)
                         break
                     except (TimeoutError, OSError) as e:
                         if attempt==2:
@@ -462,6 +463,12 @@ def history_worker(chats):
                         continue
                     key=(p.get("_data") or {}).get("key") or {}
                     canonical=str(key.get("remoteJidAlt") or key.get("remoteJid") or chat).replace("@s.whatsapp.net","@c.us")
+                    if senders_only:
+                        sender,name=group_sender(p,canonical)
+                        with closing(db()) as c,c:
+                            changed=c.execute("UPDATE events SET sender_id=COALESCE(?,sender_id),sender_name=COALESCE(?,sender_name) WHERE kind='message.any' AND chat=? AND message_id=? AND (sender_id IS NULL OR sender_name IS NULL)",(sender,name,canonical,str(p["id"]))).rowcount if sender or name else 0
+                        import_status["added"]+=changed
+                        continue
                     if store_message(p,canonical):
                         import_status["added"]+=1
                     else:
@@ -528,7 +535,7 @@ def history(q: str="", _: None=Depends(authorized)):
                 options.append((label.casefold(),'<label style="display:block;padding:7px"><input type="checkbox" name="chats" value="'+esc(cid)+'"> '+avatar+esc(label)+' · '+esc(number)+'</label>'))
             options=[markup for _,markup in sorted(options)]
             body+='<form method="get"><input name="q" placeholder="Cerca nome o numero" value="'+esc(q)+'"><button>Cerca</button></form>'
-            body+='<form method="post" action="/history/start">'+hidden+'<button>Importa selezionate</button><p>'+''.join(options)+'</p></form>'
+            body+='<form method="post" action="/history/start">'+hidden+'<button>Importa selezionate</button><button name="senders_only" value="1">Recupera solo mittenti dei gruppi</button><p>'+''.join(options)+'</p></form>'
         except Exception as e:
             body+='<p>Elenco chat non disponibile: '+esc(type(e).__name__)+'</p>'
     return page("Importazione storico",body)
@@ -546,7 +553,7 @@ async def history_action(action: str,request: Request,_: None=Depends(authorized
             raise HTTPException(409)
         import_cancel.clear()
         import_status.update(running=True,added=0,duplicates=0,failed=0,detail="Avvio")
-        threading.Thread(target=history_worker,args=(chats,),daemon=True).start()
+        threading.Thread(target=history_worker,args=(chats,data.get("senders_only",[""])[0]=="1"),daemon=True).start()
     else:
         raise HTTPException(404)
     return RedirectResponse("/history",303)
@@ -702,4 +709,4 @@ def dashboard(q: str = "", chat: str = "", contact_q: str = "", _: None = Depend
         bubbles += '<article class="bubble '+cls+'"><small>'+esc(display_name)+' · '+label+'</small><div>'+esc(body or "[Messaggio senza testo]")+'</div>'+preview+'<small>'+date+'</small>'+('<p style="color:#c44">Messaggio revocato su WhatsApp · '+datetime.fromtimestamp(int(revoked),ZoneInfo("Europe/Rome")).strftime("%d/%m/%Y %H:%M")+'</p>' if revoked else '')+'<label><input type="checkbox" name="ids" value="'+str(mid)+'" form="delete-selected"> Seleziona</label></article>'
     return """<!doctype html><html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WhatsApp Archive</title><style>
     *{box-sizing:border-box}body{margin:0;font:15px system-ui;background:#eef2ef;color:#17251e}header{padding:16px;background:#075e54;color:white}main{display:grid;grid-template-columns:minmax(180px,30%) 1fr;min-height:80vh}aside{background:white;border-right:1px solid #ccc;padding:12px;overflow-wrap:anywhere}.contact{display:block;padding:14px;color:inherit;text-decoration:none;border-bottom:1px solid #ddd}.avatar{width:38px;height:38px;border-radius:50%;object-fit:cover;float:left;margin-right:10px}.initials{display:grid;place-items:center;background:#d9eee6;color:#075e54;font-weight:bold}.contact{min-height:70px;overflow:hidden}.active{background:#d9eee6}small{display:block;opacity:.75;font-size:12px}section{padding:16px;min-width:0}.bubble{max-width:85%;width:fit-content;background:white;border-radius:12px;padding:12px;margin:10px 0;overflow-wrap:anywhere}.bubble div{white-space:pre-wrap;margin:6px 0}.out{margin-left:auto;background:#d9fdd3}.unknown{background:#e5e5e5}form{display:flex;gap:8px;flex-wrap:wrap}input,button{padding:10px;border:1px solid #aaa;border-radius:6px}a{color:inherit}@media(prefers-color-scheme:dark){body{background:#15221e;color:#eee}aside,.bubble{background:#263830}.out,.active{background:#285b48}.unknown{background:#424242}}@media(max-width:600px){main{grid-template-columns:1fr}aside{max-height:30vh;overflow:auto}}
-    </style></head><body><header><strong>WhatsApp Archive v0.7.4</strong> · """+str(total)+""" messaggi <span style="float:right">"""+esc(storage_summary())+""" · <a href="/storage">Gestione media</a> · <a href="/calls">Registro chiamate</a> · <a href="/history">Importa storico</a> · <a href="/monitor">WAHA: """+esc(monitor["status"])+"""</a></span></header><main><aside><a href="/">Conversazioni</a> · <a href="/?q=%25">Tutte</a>"""+refresh_button()+contact_search+links+"""</aside><section><form><input type="hidden" name="chat" value=" """ .rstrip()+esc(chat)+'''"><input name="q" placeholder="Cerca nella conversazione" value="'''+esc(q)+'''"><button>Cerca</button><a href="/?q='''+esc(urlencode({"q":q})[2:])+'''">Ricerca globale</a></form><h2>'''+esc(contacts.get(chat,(None,False))[0] or chat or "Tutte le conversazioni")+'''</h2><p>Ultimi 300 risultati · aggiorna la pagina per nuovi messaggi</p>'''+controls(chat)+(bubbles or "<p>Nessun messaggio trovato.</p>")+'''</section></main></body></html>'''
+    </style></head><body><header><strong>WhatsApp Archive v0.7.5</strong> · """+str(total)+""" messaggi <span style="float:right">"""+esc(storage_summary())+""" · <a href="/storage">Gestione media</a> · <a href="/calls">Registro chiamate</a> · <a href="/history">Importa storico</a> · <a href="/monitor">WAHA: """+esc(monitor["status"])+"""</a></span></header><main><aside><a href="/">Conversazioni</a> · <a href="/?q=%25">Tutte</a>"""+refresh_button()+contact_search+links+"""</aside><section><form><input type="hidden" name="chat" value=" """ .rstrip()+esc(chat)+'''"><input name="q" placeholder="Cerca nella conversazione" value="'''+esc(q)+'''"><button>Cerca</button><a href="/?q='''+esc(urlencode({"q":q})[2:])+'''">Ricerca globale</a></form><h2>'''+esc(contacts.get(chat,(None,False))[0] or chat or "Tutte le conversazioni")+'''</h2><p>Ultimi 300 risultati · aggiorna la pagina per nuovi messaggi</p>'''+controls(chat)+(bubbles or "<p>Nessun messaggio trovato.</p>")+'''</section></main></body></html>'''
