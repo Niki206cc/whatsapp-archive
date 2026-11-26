@@ -462,7 +462,7 @@ def history_worker(chats):
         import_guard.release()
 
 @app.get("/history",response_class=HTMLResponse)
-def history(_: None=Depends(authorized)):
+def history(q: str="", _: None=Depends(authorized)):
     hidden='<input type="hidden" name="token" value="'+csrf()+'">'
     status=import_status.copy()
     body='<p>'+esc(status["detail"])+'</p><p>Importati: '+str(status["added"])+' · Duplicati: '+str(status["duplicates"])+' · Non validi: '+str(status["failed"])+'</p>'
@@ -473,6 +473,24 @@ def history(_: None=Depends(authorized)):
             chats=waha_json("/api/default/chats",{})
             if not isinstance(chats,list):
                 raise ValueError()
+            with closing(db()) as c:
+                known={row[0]:(row[1],row[2]) for row in c.execute("SELECT chat,name,photo IS NOT NULL FROM contacts")}
+            try:
+                directory=waha_json("/api/contacts/all",{"session":"default"},timeout=30)
+                if isinstance(directory,list):
+                    for contact in directory:
+                        if not isinstance(contact,dict):
+                            continue
+                        ident=contact.get("id")
+                        if isinstance(ident,dict):
+                            ident=ident.get("_serialized")
+                        name=contact.get("name") or contact.get("pushname") or contact.get("pushName")
+                        if isinstance(ident,str) and isinstance(name,str) and name:
+                            ident=ident.replace("@s.whatsapp.net","@c.us")
+                            old=known.get(ident,(None,False))
+                            known[ident]=(old[0] or name,old[1])
+            except Exception as e:
+                logging.warning("History contacts: %s",type(e).__name__)
             options=[]
             for item in chats:
                 if not isinstance(item,dict):
@@ -482,7 +500,16 @@ def history(_: None=Depends(authorized)):
                     cid=cid.get("_serialized")
                 if not isinstance(cid,str) or not cid:
                     continue
-                options.append('<label><input type="checkbox" name="chats" value="'+esc(cid)+'"> '+esc(item.get("name") or cid)+' · '+esc(cid)+'</label><br>')
+                canonical=cid.replace("@s.whatsapp.net","@c.us")
+                saved,photo=known.get(canonical,(None,False))
+                label=str(saved or item.get("name") or item.get("subject") or cid)
+                number="+"+canonical.split("@")[0] if re.fullmatch(r"[0-9]+@c.us",canonical) else canonical
+                if q.casefold() not in (label+" "+number).casefold():
+                    continue
+                avatar='<img style="width:32px;height:32px;border-radius:50%;object-fit:cover;vertical-align:middle" src="/avatar?'+esc(urlencode({"chat":canonical}))+'"> ' if photo else ""
+                options.append((label.casefold(),'<label style="display:block;padding:7px"><input type="checkbox" name="chats" value="'+esc(cid)+'"> '+avatar+esc(label)+' · '+esc(number)+'</label>'))
+            options=[markup for _,markup in sorted(options)]
+            body+='<form method="get"><input name="q" placeholder="Cerca nome o numero" value="'+esc(q)+'"><button>Cerca</button></form>'
             body+='<form method="post" action="/history/start">'+hidden+'<button>Importa selezionate</button><p>'+''.join(options)+'</p></form>'
         except Exception as e:
             body+='<p>Elenco chat non disponibile: '+esc(type(e).__name__)+'</p>'
@@ -550,4 +577,4 @@ def dashboard(q: str = "", chat: str = "", contact_q: str = "", _: None = Depend
         bubbles += '<article class="bubble '+cls+'"><small>'+esc(contacts.get(name,(None,False))[0] or name)+' · '+label+'</small><div>'+esc(body or "[Messaggio senza testo]")+'</div>'+preview+'<small>'+date+'</small>'+('<p style="color:#c44">Messaggio revocato su WhatsApp · '+datetime.fromtimestamp(int(revoked),ZoneInfo("Europe/Rome")).strftime("%d/%m/%Y %H:%M")+'</p>' if revoked else '')+'<label><input type="checkbox" name="ids" value="'+str(mid)+'" form="delete-selected"> Seleziona</label></article>'
     return """<!doctype html><html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WhatsApp Archive</title><style>
     *{box-sizing:border-box}body{margin:0;font:15px system-ui;background:#eef2ef;color:#17251e}header{padding:16px;background:#075e54;color:white}main{display:grid;grid-template-columns:minmax(180px,30%) 1fr;min-height:80vh}aside{background:white;border-right:1px solid #ccc;padding:12px;overflow-wrap:anywhere}.contact{display:block;padding:14px;color:inherit;text-decoration:none;border-bottom:1px solid #ddd}.avatar{width:38px;height:38px;border-radius:50%;object-fit:cover;float:left;margin-right:10px}.initials{display:grid;place-items:center;background:#d9eee6;color:#075e54;font-weight:bold}.contact{min-height:70px;overflow:hidden}.active{background:#d9eee6}small{display:block;opacity:.75;font-size:12px}section{padding:16px;min-width:0}.bubble{max-width:85%;width:fit-content;background:white;border-radius:12px;padding:12px;margin:10px 0;overflow-wrap:anywhere}.bubble div{white-space:pre-wrap;margin:6px 0}.out{margin-left:auto;background:#d9fdd3}.unknown{background:#e5e5e5}form{display:flex;gap:8px;flex-wrap:wrap}input,button{padding:10px;border:1px solid #aaa;border-radius:6px}a{color:inherit}@media(prefers-color-scheme:dark){body{background:#15221e;color:#eee}aside,.bubble{background:#263830}.out,.active{background:#285b48}.unknown{background:#424242}}@media(max-width:600px){main{grid-template-columns:1fr}aside{max-height:30vh;overflow:auto}}
-    </style></head><body><header><strong>WhatsApp Archive v0.7.1</strong> · """+str(total)+""" messaggi <span style="float:right">"""+esc(storage_summary())+""" · <a href="/storage">Gestione media</a> · <a href="/calls">Registro chiamate</a> · <a href="/history">Importa storico</a></span></header><main><aside><a href="/">Conversazioni</a> · <a href="/?q=%25">Tutte</a>"""+refresh_button()+contact_search+links+"""</aside><section><form><input type="hidden" name="chat" value=" """ .rstrip()+esc(chat)+'''"><input name="q" placeholder="Cerca nella conversazione" value="'''+esc(q)+'''"><button>Cerca</button><a href="/?q='''+esc(urlencode({"q":q})[2:])+'''">Ricerca globale</a></form><h2>'''+esc(contacts.get(chat,(None,False))[0] or chat or "Tutte le conversazioni")+'''</h2><p>Ultimi 300 risultati · aggiorna la pagina per nuovi messaggi</p>'''+controls(chat)+(bubbles or "<p>Nessun messaggio trovato.</p>")+'''</section></main></body></html>'''
+    </style></head><body><header><strong>WhatsApp Archive v0.7.2</strong> · """+str(total)+""" messaggi <span style="float:right">"""+esc(storage_summary())+""" · <a href="/storage">Gestione media</a> · <a href="/calls">Registro chiamate</a> · <a href="/history">Importa storico</a></span></header><main><aside><a href="/">Conversazioni</a> · <a href="/?q=%25">Tutte</a>"""+refresh_button()+contact_search+links+"""</aside><section><form><input type="hidden" name="chat" value=" """ .rstrip()+esc(chat)+'''"><input name="q" placeholder="Cerca nella conversazione" value="'''+esc(q)+'''"><button>Cerca</button><a href="/?q='''+esc(urlencode({"q":q})[2:])+'''">Ricerca globale</a></form><h2>'''+esc(contacts.get(chat,(None,False))[0] or chat or "Tutte le conversazioni")+'''</h2><p>Ultimi 300 risultati · aggiorna la pagina per nuovi messaggi</p>'''+controls(chat)+(bubbles or "<p>Nessun messaggio trovato.</p>")+'''</section></main></body></html>'''
