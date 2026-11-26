@@ -189,9 +189,9 @@ async def delete_local(request: Request, _: None = Depends(authorized)):
                 (MEDIA/f).unlink(missing_ok=True)
     return RedirectResponse("/?"+urlencode({"chat":chat}) if chat and not whole else "/",303)
 
-def waha_json(path,params):
+def waha_json(path,params,timeout=10):
     req=URLRequest("http://waha:3000"+path+"?"+urlencode(params),headers={"X-Api-Key":os.environ.get("WAHA_API_KEY","")})
-    with build_opener(NoRedirect()).open(req,timeout=10) as res:
+    with build_opener(NoRedirect()).open(req,timeout=timeout) as res:
         return json.loads(res.read(4000000))
 
 @app.post("/contacts/refresh")
@@ -415,7 +415,19 @@ def history_worker(chats):
             seen=set()
             while not import_cancel.is_set():
                 import_status["detail"]="Importazione: "+chat+" · "+str(offset)
-                batch=waha_json("/api/default/chats/"+quote(chat,safe="")+"/messages",{"limit":50,"offset":offset,"downloadMedia":"true"})
+                for attempt in range(3):
+                    try:
+                        batch=waha_json("/api/default/chats/"+quote(chat,safe="")+"/messages",{"limit":20,"offset":offset,"downloadMedia":"true"},timeout=120)
+                        break
+                    except (TimeoutError, OSError) as e:
+                        if attempt==2:
+                            raise
+                        import_status["detail"]="WAHA lento: nuovo tentativo "+str(attempt+2)+"/3 · offset "+str(offset)
+                        if import_cancel.wait(5*(attempt+1)):
+                            import_status["detail"]="Interrotta"
+                            return
+                if import_cancel.is_set():
+                    break
                 if not isinstance(batch,list):
                     raise ValueError("Formato storico inatteso")
                 if not batch:
@@ -437,7 +449,7 @@ def history_worker(chats):
                     else:
                         import_status["duplicates"]+=1
                 offset+=len(batch)
-                if len(batch)<50:
+                if len(batch)<20:
                     break
             if import_cancel.is_set():
                 break
@@ -538,4 +550,4 @@ def dashboard(q: str = "", chat: str = "", contact_q: str = "", _: None = Depend
         bubbles += '<article class="bubble '+cls+'"><small>'+esc(contacts.get(name,(None,False))[0] or name)+' · '+label+'</small><div>'+esc(body or "[Messaggio senza testo]")+'</div>'+preview+'<small>'+date+'</small>'+('<p style="color:#c44">Messaggio revocato su WhatsApp · '+datetime.fromtimestamp(int(revoked),ZoneInfo("Europe/Rome")).strftime("%d/%m/%Y %H:%M")+'</p>' if revoked else '')+'<label><input type="checkbox" name="ids" value="'+str(mid)+'" form="delete-selected"> Seleziona</label></article>'
     return """<!doctype html><html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WhatsApp Archive</title><style>
     *{box-sizing:border-box}body{margin:0;font:15px system-ui;background:#eef2ef;color:#17251e}header{padding:16px;background:#075e54;color:white}main{display:grid;grid-template-columns:minmax(180px,30%) 1fr;min-height:80vh}aside{background:white;border-right:1px solid #ccc;padding:12px;overflow-wrap:anywhere}.contact{display:block;padding:14px;color:inherit;text-decoration:none;border-bottom:1px solid #ddd}.avatar{width:38px;height:38px;border-radius:50%;object-fit:cover;float:left;margin-right:10px}.initials{display:grid;place-items:center;background:#d9eee6;color:#075e54;font-weight:bold}.contact{min-height:70px;overflow:hidden}.active{background:#d9eee6}small{display:block;opacity:.75;font-size:12px}section{padding:16px;min-width:0}.bubble{max-width:85%;width:fit-content;background:white;border-radius:12px;padding:12px;margin:10px 0;overflow-wrap:anywhere}.bubble div{white-space:pre-wrap;margin:6px 0}.out{margin-left:auto;background:#d9fdd3}.unknown{background:#e5e5e5}form{display:flex;gap:8px;flex-wrap:wrap}input,button{padding:10px;border:1px solid #aaa;border-radius:6px}a{color:inherit}@media(prefers-color-scheme:dark){body{background:#15221e;color:#eee}aside,.bubble{background:#263830}.out,.active{background:#285b48}.unknown{background:#424242}}@media(max-width:600px){main{grid-template-columns:1fr}aside{max-height:30vh;overflow:auto}}
-    </style></head><body><header><strong>WhatsApp Archive v0.7</strong> · """+str(total)+""" messaggi <span style="float:right">"""+esc(storage_summary())+""" · <a href="/storage">Gestione media</a> · <a href="/calls">Registro chiamate</a> · <a href="/history">Importa storico</a></span></header><main><aside><a href="/">Conversazioni</a> · <a href="/?q=%25">Tutte</a>"""+refresh_button()+contact_search+links+"""</aside><section><form><input type="hidden" name="chat" value=" """ .rstrip()+esc(chat)+'''"><input name="q" placeholder="Cerca nella conversazione" value="'''+esc(q)+'''"><button>Cerca</button><a href="/?q='''+esc(urlencode({"q":q})[2:])+'''">Ricerca globale</a></form><h2>'''+esc(contacts.get(chat,(None,False))[0] or chat or "Tutte le conversazioni")+'''</h2><p>Ultimi 300 risultati · aggiorna la pagina per nuovi messaggi</p>'''+controls(chat)+(bubbles or "<p>Nessun messaggio trovato.</p>")+'''</section></main></body></html>'''
+    </style></head><body><header><strong>WhatsApp Archive v0.7.1</strong> · """+str(total)+""" messaggi <span style="float:right">"""+esc(storage_summary())+""" · <a href="/storage">Gestione media</a> · <a href="/calls">Registro chiamate</a> · <a href="/history">Importa storico</a></span></header><main><aside><a href="/">Conversazioni</a> · <a href="/?q=%25">Tutte</a>"""+refresh_button()+contact_search+links+"""</aside><section><form><input type="hidden" name="chat" value=" """ .rstrip()+esc(chat)+'''"><input name="q" placeholder="Cerca nella conversazione" value="'''+esc(q)+'''"><button>Cerca</button><a href="/?q='''+esc(urlencode({"q":q})[2:])+'''">Ricerca globale</a></form><h2>'''+esc(contacts.get(chat,(None,False))[0] or chat or "Tutte le conversazioni")+'''</h2><p>Ultimi 300 risultati · aggiorna la pagina per nuovi messaggi</p>'''+controls(chat)+(bubbles or "<p>Nessun messaggio trovato.</p>")+'''</section></main></body></html>'''
