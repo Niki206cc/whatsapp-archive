@@ -1,0 +1,19 @@
+services:
+  archive:
+    build: .
+    container_name: whatsapp-archive
+    restart: unless-stopped
+    ports:
+      - '127.0.0.1:8085:8085'
+    environment:
+      ARCHIVE_PASSWORD: ${ARCHIVE_PASSWORD:?required}
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:?required}
+    volumes:
+      - archive_data:/data
+    networks:
+      - whatsapp-net
+volumes:
+  archive_data:
+networks:
+  whatsapp-net:
+    external: true
