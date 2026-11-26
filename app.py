@@ -111,10 +111,15 @@ async def webhook(request: Request):
     if kind == "message.revoked":
         before = p.get("before") or {}
         after = p.get("after") or {}
-        mid = before.get("id") or after.get("id") or p.get("id")
-        if isinstance(mid,str):
+        mid = p.get("revokedMessageId") or before.get("id")
+        matched = 0
+        if isinstance(mid,str) and mid:
             with closing(db()) as c,c:
-                c.execute("UPDATE events SET revoked=? WHERE message_id=?",(str(int(time.time())),mid))
+                rows = c.execute("SELECT id,message_id FROM events WHERE kind='message.any' AND message_id IS NOT NULL").fetchall()
+                candidates = [rid for rid, stored in rows if stored == mid or (stored.split("_",3)[2] == mid if len(stored.split("_",3)) >= 3 else False)]
+                if len(candidates)==1:
+                    matched = c.execute("UPDATE events SET revoked=? WHERE id=?",(str(int(time.time())),candidates[0])).rowcount
+        logging.warning("Revoke event: original_id_present=%s matched=%s",bool(mid),matched)
         return {"ok":True}
     attachment = await run_in_threadpool(save_media,p) if kind == "message.any" else (None,)*5
     body = p.get("body") if kind == "message.any" else p.get("status")
@@ -249,4 +254,4 @@ def dashboard(q: str = "", chat: str = "", _: None = Depends(authorized)):
         bubbles += '<article class="bubble '+cls+'"><small>'+esc(contacts.get(name,(None,False))[0] or name)+' · '+label+'</small><div>'+esc(body or "[Messaggio senza testo]")+'</div>'+preview+'<small>'+date+'</small>'+('<p style="color:#c44">Messaggio revocato su WhatsApp · '+datetime.fromtimestamp(int(revoked),ZoneInfo("Europe/Rome")).strftime("%d/%m/%Y %H:%M")+'</p>' if revoked else '')+'<label><input type="checkbox" name="ids" value="'+str(mid)+'" form="delete-selected"> Seleziona</label></article>'
     return """<!doctype html><html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WhatsApp Archive</title><style>
     *{box-sizing:border-box}body{margin:0;font:15px system-ui;background:#eef2ef;color:#17251e}header{padding:16px;background:#075e54;color:white}main{display:grid;grid-template-columns:minmax(180px,30%) 1fr;min-height:80vh}aside{background:white;border-right:1px solid #ccc;padding:12px;overflow-wrap:anywhere}.contact{display:block;padding:14px;color:inherit;text-decoration:none;border-bottom:1px solid #ddd}.avatar{width:38px;height:38px;border-radius:50%;object-fit:cover;float:left;margin-right:10px}.active{background:#d9eee6}small{display:block;opacity:.75;font-size:12px}section{padding:16px;min-width:0}.bubble{max-width:85%;width:fit-content;background:white;border-radius:12px;padding:12px;margin:10px 0;overflow-wrap:anywhere}.bubble div{white-space:pre-wrap;margin:6px 0}.out{margin-left:auto;background:#d9fdd3}.unknown{background:#e5e5e5}form{display:flex;gap:8px;flex-wrap:wrap}input,button{padding:10px;border:1px solid #aaa;border-radius:6px}a{color:inherit}@media(prefers-color-scheme:dark){body{background:#15221e;color:#eee}aside,.bubble{background:#263830}.out,.active{background:#285b48}.unknown{background:#424242}}@media(max-width:600px){main{grid-template-columns:1fr}aside{max-height:30vh;overflow:auto}}
-    </style></head><body><header><strong>WhatsApp Archive v0.4</strong> · """+str(total)+""" messaggi</header><main><aside><a href="/">Conversazioni</a> · <a href="/?q=%25">Tutte</a>"""+refresh_button()+links+"""</aside><section><form><input type="hidden" name="chat" value=" """ .rstrip()+esc(chat)+'''"><input name="q" placeholder="Cerca nella conversazione" value="'''+esc(q)+'''"><button>Cerca</button><a href="/?q='''+esc(urlencode({"q":q})[2:])+'''">Ricerca globale</a></form><h2>'''+esc(contacts.get(chat,(None,False))[0] or chat or "Tutte le conversazioni")+'''</h2><p>Ultimi 300 risultati · aggiorna la pagina per nuovi messaggi</p>'''+controls(chat)+(bubbles or "<p>Nessun messaggio trovato.</p>")+'''</section></main></body></html>'''
+    </style></head><body><header><strong>WhatsApp Archive v0.4.1</strong> · """+str(total)+""" messaggi</header><main><aside><a href="/">Conversazioni</a> · <a href="/?q=%25">Tutte</a>"""+refresh_button()+links+"""</aside><section><form><input type="hidden" name="chat" value=" """ .rstrip()+esc(chat)+'''"><input name="q" placeholder="Cerca nella conversazione" value="'''+esc(q)+'''"><button>Cerca</button><a href="/?q='''+esc(urlencode({"q":q})[2:])+'''">Ricerca globale</a></form><h2>'''+esc(contacts.get(chat,(None,False))[0] or chat or "Tutte le conversazioni")+'''</h2><p>Ultimi 300 risultati · aggiorna la pagina per nuovi messaggi</p>'''+controls(chat)+(bubbles or "<p>Nessun messaggio trovato.</p>")+'''</section></main></body></html>'''
