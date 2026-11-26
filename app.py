@@ -37,6 +37,7 @@ def db():
                 c.execute("ALTER TABLE events ADD COLUMN "+name+" TEXT")
         c.execute("CREATE TABLE IF NOT EXISTS contacts (chat TEXT PRIMARY KEY, name TEXT, photo BLOB, mime TEXT)")
         c.execute("CREATE TABLE IF NOT EXISTS contact_refresh (chat TEXT PRIMARY KEY, attempted INTEGER)")
+        c.execute("CREATE TABLE IF NOT EXISTS call_events (session TEXT, call_id TEXT, kind TEXT, peer TEXT, stamp INTEGER, observed INTEGER, video INTEGER, grp INTEGER, PRIMARY KEY(session,call_id,kind))")
     return c
 
 def authorized(c: HTTPBasicCredentials = Depends(auth)):
@@ -100,6 +101,8 @@ async def webhook(request: Request):
     if not isinstance(event, dict):
         raise HTTPException(400)
     kind = event.get("event")
+    if kind in ("call.received","call.accepted","call.rejected"):
+        return record_call(event)
     if kind not in ("message.any", "session.status", "message.revoked"):
         return {"ignored": True}
     p = event.get("payload") or {}
@@ -338,6 +341,51 @@ def storage_action_sync(action,data):
     return RedirectResponse("/storage",303)
 
 
+
+def record_call(event):
+    p=event.get("payload")
+    if not isinstance(p,dict) or not isinstance(p.get("id"),str) or not p["id"]:
+        raise HTTPException(400)
+    stamp=p.get("timestamp")
+    if not isinstance(stamp,(int,float)) or not 0<stamp<4102444800:
+        stamp=None
+    peer=str(p.get("from") or "").replace("@s.whatsapp.net","@c.us")
+    with closing(db()) as c,c:
+        c.execute("INSERT OR IGNORE INTO call_events VALUES(?,?,?,?,?,?,?,?)",(str(event.get("session") or "default"),p["id"],event["event"],peer,int(stamp) if stamp else None,int(time.time()),int(p["isVideo"]) if isinstance(p.get("isVideo"),bool) else None,int(p["isGroup"]) if isinstance(p.get("isGroup"),bool) else None))
+    logging.info("Call event stored: %s",event["event"])
+    return {"ok":True}
+
+@app.get("/calls",response_class=HTMLResponse)
+def calls(q: str="", _: None=Depends(authorized)):
+    with closing(db()) as c:
+        rows=c.execute("SELECT session,call_id,kind,peer,stamp,observed,video,grp FROM call_events ORDER BY observed DESC").fetchall()
+        names=dict(c.execute("SELECT chat,name FROM contacts"))
+    grouped={}
+    for session,cid,kind,peer,stamp,observed,video,grp in rows:
+        grouped.setdefault((session,cid),{})[kind]=(peer,stamp,observed,video,grp)
+    result=[]
+    for events in grouped.values():
+        received=events.get("call.received")
+        accepted=events.get("call.accepted")
+        ended=events.get("call.rejected")
+        peer,stamp,observed,video,grp=received or accepted or ended
+        label=names.get(peer) or peer or "Sconosciuto"
+        if q.casefold() not in (label+" "+peer).casefold():
+            continue
+        status="Terminata dopo risposta" if accepted and ended and ended[2]>=accepted[2] else "Accettata" if accepted else "Rifiutata o terminata, risposta non rilevata" if ended else "Ricevuta, esito non noto"
+        duration="Non disponibile"
+        if accepted and ended and accepted[1] and ended[1] and ended[1]>accepted[1]:
+            delta=ended[1]-accepted[1]
+            duration=f"Stimata: {delta//60} min {delta%60} sec"
+        date=datetime.fromtimestamp(stamp or observed,ZoneInfo("Europe/Rome")).strftime("%d/%m/%Y %H:%M:%S")
+        if not stamp:
+            date+=" (ricezione evento)"
+        typ=("Video" if video else "Vocale" if video==0 else "Non nota")+(" · Gruppo" if grp else "")
+        result.append('<tr><td>'+esc(label)+'<br><small>'+esc(peer)+'</small></td><td>Entrata</td><td>'+esc(date)+'</td><td>'+esc(typ)+'</td><td>'+esc(status)+'</td><td>'+esc(duration)+'</td></tr>')
+    body='<p>Eventi WAHA ricevuti: '+str(len(rows))+' · Chiamate rilevate: '+str(len(grouped))+'</p><p>Le chiamate in uscita non sono documentate da NOWEB. La durata è stimata soltanto quando sono disponibili timestamp distinti di risposta e termine.</p><form><input name="q" placeholder="Cerca contatto" value="'+esc(q)+'"><button>Cerca</button></form><table><tr><th>Contatto</th><th>Direzione</th><th>Data e ora</th><th>Tipo</th><th>Esito</th><th>Durata</th></tr>'+''.join(result)+'</table>'
+    return page("Registro chiamate",body)
+
+
 @app.get("/", response_class=HTMLResponse)
 def dashboard(q: str = "", chat: str = "", contact_q: str = "", _: None = Depends(authorized)):
     with closing(db()) as c:
@@ -381,4 +429,4 @@ def dashboard(q: str = "", chat: str = "", contact_q: str = "", _: None = Depend
         bubbles += '<article class="bubble '+cls+'"><small>'+esc(contacts.get(name,(None,False))[0] or name)+' · '+label+'</small><div>'+esc(body or "[Messaggio senza testo]")+'</div>'+preview+'<small>'+date+'</small>'+('<p style="color:#c44">Messaggio revocato su WhatsApp · '+datetime.fromtimestamp(int(revoked),ZoneInfo("Europe/Rome")).strftime("%d/%m/%Y %H:%M")+'</p>' if revoked else '')+'<label><input type="checkbox" name="ids" value="'+str(mid)+'" form="delete-selected"> Seleziona</label></article>'
     return """<!doctype html><html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WhatsApp Archive</title><style>
     *{box-sizing:border-box}body{margin:0;font:15px system-ui;background:#eef2ef;color:#17251e}header{padding:16px;background:#075e54;color:white}main{display:grid;grid-template-columns:minmax(180px,30%) 1fr;min-height:80vh}aside{background:white;border-right:1px solid #ccc;padding:12px;overflow-wrap:anywhere}.contact{display:block;padding:14px;color:inherit;text-decoration:none;border-bottom:1px solid #ddd}.avatar{width:38px;height:38px;border-radius:50%;object-fit:cover;float:left;margin-right:10px}.initials{display:grid;place-items:center;background:#d9eee6;color:#075e54;font-weight:bold}.contact{min-height:70px;overflow:hidden}.active{background:#d9eee6}small{display:block;opacity:.75;font-size:12px}section{padding:16px;min-width:0}.bubble{max-width:85%;width:fit-content;background:white;border-radius:12px;padding:12px;margin:10px 0;overflow-wrap:anywhere}.bubble div{white-space:pre-wrap;margin:6px 0}.out{margin-left:auto;background:#d9fdd3}.unknown{background:#e5e5e5}form{display:flex;gap:8px;flex-wrap:wrap}input,button{padding:10px;border:1px solid #aaa;border-radius:6px}a{color:inherit}@media(prefers-color-scheme:dark){body{background:#15221e;color:#eee}aside,.bubble{background:#263830}.out,.active{background:#285b48}.unknown{background:#424242}}@media(max-width:600px){main{grid-template-columns:1fr}aside{max-height:30vh;overflow:auto}}
-    </style></head><body><header><strong>WhatsApp Archive v0.5</strong> · """+str(total)+""" messaggi <span style="float:right">"""+esc(storage_summary())+""" · <a href="/storage">Gestione media</a></span></header><main><aside><a href="/">Conversazioni</a> · <a href="/?q=%25">Tutte</a>"""+refresh_button()+contact_search+links+"""</aside><section><form><input type="hidden" name="chat" value=" """ .rstrip()+esc(chat)+'''"><input name="q" placeholder="Cerca nella conversazione" value="'''+esc(q)+'''"><button>Cerca</button><a href="/?q='''+esc(urlencode({"q":q})[2:])+'''">Ricerca globale</a></form><h2>'''+esc(contacts.get(chat,(None,False))[0] or chat or "Tutte le conversazioni")+'''</h2><p>Ultimi 300 risultati · aggiorna la pagina per nuovi messaggi</p>'''+controls(chat)+(bubbles or "<p>Nessun messaggio trovato.</p>")+'''</section></main></body></html>'''
+    </style></head><body><header><strong>WhatsApp Archive v0.6</strong> · """+str(total)+""" messaggi <span style="float:right">"""+esc(storage_summary())+""" · <a href="/storage">Gestione media</a> · <a href="/calls">Registro chiamate</a></span></header><main><aside><a href="/">Conversazioni</a> · <a href="/?q=%25">Tutte</a>"""+refresh_button()+contact_search+links+"""</aside><section><form><input type="hidden" name="chat" value=" """ .rstrip()+esc(chat)+'''"><input name="q" placeholder="Cerca nella conversazione" value="'''+esc(q)+'''"><button>Cerca</button><a href="/?q='''+esc(urlencode({"q":q})[2:])+'''">Ricerca globale</a></form><h2>'''+esc(contacts.get(chat,(None,False))[0] or chat or "Tutte le conversazioni")+'''</h2><p>Ultimi 300 risultati · aggiorna la pagina per nuovi messaggi</p>'''+controls(chat)+(bubbles or "<p>Nessun messaggio trovato.</p>")+'''</section></main></body></html>'''
