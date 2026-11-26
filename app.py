@@ -3,6 +3,9 @@ from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.responses import HTMLResponse
 from contextlib import closing
+from datetime import datetime
+from zoneinfo import ZoneInfo
+from urllib.parse import urlencode
 
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 auth = HTTPBasic()
@@ -15,6 +18,11 @@ def db():
     c = sqlite3.connect("/data/archive.sqlite", timeout=15)
     c.execute("PRAGMA journal_mode=WAL")
     c.execute("CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY, received INTEGER, kind TEXT, chat TEXT, body TEXT)")
+    with c:
+        cols = {row[1] for row in c.execute("PRAGMA table_info(events)")}
+        if "direction" not in cols:
+            c.execute("ALTER TABLE events ADD COLUMN direction TEXT")
+        c.execute("CREATE INDEX IF NOT EXISTS events_chat ON events(chat,id)")
     return c
 
 def authorized(c: HTTPBasicCredentials = Depends(auth)):
@@ -40,12 +48,28 @@ async def webhook(request: Request):
     chat = p.get("to") if p.get("fromMe") else p.get("from")
     body = p.get("body") if kind == "message.any" else p.get("status")
     with closing(db()) as c, c:
-        c.execute("INSERT INTO events(received,kind,chat,body) VALUES(?,?,?,?)",(int(time.time()),kind,str(chat or ""),str(body or "")))
+        c.execute("INSERT INTO events(received,kind,chat,body,direction) VALUES(?,?,?,?,?)",(int(time.time()),kind,str(chat or ""),str(body or ""), ("out" if p.get("fromMe") else "in") if kind == "message.any" else None))
     return {"ok": True}
 
+
+def esc(v):
+    return html.escape(str(v or ""), quote=True)
+
 @app.get("/", response_class=HTMLResponse)
-def dashboard(q: str = "", _: None = Depends(authorized)):
+def dashboard(q: str = "", chat: str = "", _: None = Depends(authorized)):
     with closing(db()) as c:
-        rows = c.execute("SELECT datetime(received,'unixepoch'),kind,chat,body FROM events WHERE body LIKE ? OR chat LIKE ? ORDER BY id DESC LIMIT 200",("%"+q+"%","%"+q+"%")).fetchall()
-    table = "".join("<tr>"+"".join("<td>"+html.escape(str(v or ""))+"</td>" for v in r)+"</tr>" for r in rows)
-    return '<!doctype html><html lang="it"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>WhatsApp Archive</title><style>body{font:16px system-ui;margin:2rem;background:#f4f6f5;color:#17251e}table{border-collapse:collapse;width:100%;background:white}td,th{padding:12px;border-bottom:1px solid #ddd;text-align:left;overflow-wrap:anywhere}input,button{padding:10px}</style><h1>WhatsApp Archive</h1><p>Versione di test — ultimi 200 eventi, orari UTC</p><form><input name="q" placeholder="Cerca testo o contatto" value="'+html.escape(q,quote=True)+'"><button>Cerca</button></form><table><tr><th>Data</th><th>Evento</th><th>Chat</th><th>Testo</th></tr>'+table+'</table></html>'
+        chats = c.execute("SELECT chat, count(*), max(id) FROM events WHERE kind='message.any' GROUP BY chat ORDER BY max(id) DESC").fetchall()
+        total = c.execute("SELECT count(*) FROM events WHERE kind='message.any'").fetchone()[0]
+        if not chat and not q and chats:
+            chat = chats[0][0]
+        rows = c.execute("SELECT received,chat,body,direction FROM events WHERE kind='message.any' AND (?='' OR chat=?) AND (body LIKE ? OR chat LIKE ?) ORDER BY id DESC LIMIT 300",(chat,chat,"%"+q+"%","%"+q+"%")).fetchall()
+    links = "".join('<a class="contact '+('active' if name==chat else '')+'" href="/?'+esc(urlencode({"chat":name,"q":q}))+'">'+esc(name or "Sconosciuto")+' <small>'+str(n)+'</small></a>' for name,n,_ in chats)
+    bubbles = ""
+    for stamp,name,body,direction in reversed(rows):
+        date = datetime.fromtimestamp(stamp, ZoneInfo("Europe/Rome")).strftime("%d/%m/%Y %H:%M")
+        cls = direction if direction in ("in","out") else "unknown"
+        label = {"in":"Ricevuto","out":"Inviato","unknown":"Direzione non disponibile"}[cls]
+        bubbles += '<article class="bubble '+cls+'"><small>'+esc(name)+' · '+label+'</small><div>'+esc(body or "[Messaggio senza testo]")+'</div><small>'+date+'</small></article>'
+    return """<!doctype html><html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="30"><title>WhatsApp Archive</title><style>
+    *{box-sizing:border-box}body{margin:0;font:15px system-ui;background:#eef2ef;color:#17251e}header{padding:16px;background:#075e54;color:white}main{display:grid;grid-template-columns:minmax(180px,30%) 1fr;min-height:80vh}aside{background:white;border-right:1px solid #ccc;padding:12px;overflow-wrap:anywhere}.contact{display:block;padding:14px;color:inherit;text-decoration:none;border-bottom:1px solid #ddd}.active{background:#d9eee6}small{display:block;opacity:.75;font-size:12px}section{padding:16px;min-width:0}.bubble{max-width:85%;width:fit-content;background:white;border-radius:12px;padding:12px;margin:10px 0;overflow-wrap:anywhere}.bubble div{white-space:pre-wrap;margin:6px 0}.out{margin-left:auto;background:#d9fdd3}.unknown{background:#e5e5e5}form{display:flex;gap:8px;flex-wrap:wrap}input,button{padding:10px;border:1px solid #aaa;border-radius:6px}a{color:inherit}@media(prefers-color-scheme:dark){body{background:#15221e;color:#eee}aside,.bubble{background:#263830}.out,.active{background:#285b48}.unknown{background:#424242}}@media(max-width:600px){main{grid-template-columns:1fr}aside{max-height:30vh;overflow:auto}}
+    </style></head><body><header><strong>WhatsApp Archive v0.2</strong> · """+str(total)+""" messaggi</header><main><aside><a href="/">Conversazioni</a> · <a href="/?q=%25">Tutte</a>"""+links+"""</aside><section><form><input type="hidden" name="chat" value="""+\'"\'+esc(chat)+'''"><input name="q" placeholder="Cerca nella conversazione" value="'''+esc(q)+'''"><button>Cerca</button><a href="/?q='''+esc(urlencode({"q":q})[2:])+'''">Ricerca globale</a></form><h2>'''+esc(chat or "Tutte le conversazioni")+'''</h2><p>Ultimi 300 risultati · aggiornamento ogni 30 secondi</p>'''+(bubbles or "<p>Nessun messaggio trovato.</p>")+'''</section></main></body></html>'''
